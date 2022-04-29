@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <signal.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <string.h>
@@ -24,12 +25,38 @@ struct Status {
 
 struct Status status = { .type = "exit value", .val = 0 };
 
+int foreground_only = 0;
+pid_t process_in_foreground = 0;
+int TSTP_received = 0;
+char entering[] = "Entering foreground-only mode (& is now ignored)\n";
+char exiting[] = "Exiting foreground-only mode\n";
+
+
 int get_input(char buf[]);
 void parse_input(char buf[], struct Command * command);
 void print_struct(struct Command * command);
 void change_directory(struct Command * command);
-
 void handle_redirect(struct Command * command);
+void reset_SIGINT(struct Command * command);
+void ignore_SIGINT();
+void ignore_SIGTSTP();
+void set_SIGTSTP();
+void handle_SIGTSTP();
+
+
+
+void handle_SIGCHLD(){
+    int childStatus;
+    pid_t childPid = waitpid(-1, &childStatus, WNOHANG );
+    if ((childPid > 0)){  // foreground process would return -1 here
+        char * message = "\nbackground pid is done: \n";
+        write(STDOUT_FILENO, message, 26 );
+
+    }
+}
+
+
+
 
 
 void fork_and_exec(struct Command * command){
@@ -52,25 +79,45 @@ void fork_and_exec(struct Command * command){
     } else if (childPid == 0){
         // IN CHILD
         handle_redirect(command);
-        // printf("CHILD(%d) running command\n", getpid());
+        reset_SIGINT(command);
+        ignore_SIGTSTP();
+
 		execvp(argv[0], argv);
 		fprintf(stderr, "%s: %s\n", argv[0], strerror(errno));
         exit(1);
     } else {
         // IN PARENT
-		childPid = waitpid(childPid, &childStatus, 0);
-		// printf("PARENT(%d): child(%d) terminated. Exiting\n", getpid(), spawnPid);
+        if (command->background && !foreground_only) {
+            // BACKGROUND PROCESSS
+            printf("background pid is %d\n", childPid);
+            fflush(stdout);
+            // add childPid to background processes
 
-        if(WIFEXITED(childStatus)){
-            status.type = "exit value";
-            status.val = WEXITSTATUS(childStatus);
-		} else{
-            status.type = "terminated by signal";
-            status.val = WTERMSIG(childStatus);
-		}
+        } else {
+            // FOREGROUND PROCESS
+            process_in_foreground = childPid;
+            printf("foreground process is %d\n", childPid);
+            childPid = waitpid(childPid, &childStatus, 0);
+            printf("returned: %d", childPid);
+
+            process_in_foreground = 0;
+            if (TSTP_received){
+                foreground_only == 1 ? printf("\n%s", entering) : printf("\n%s", exiting);
+                fflush(stdout);
+                TSTP_received = 0;
+            }
+
+            if(WIFEXITED(childStatus)){
+                status.type = "exit value";
+                status.val = WEXITSTATUS(childStatus);
+            } else{
+                status.type = "terminated by signal";
+                status.val = WTERMSIG(childStatus);
+                printf("%s %i\n", status.type, status.val);
+                fflush(stdout);
+            }
+        }
     }
-
-
 }
 
 void execute(struct Command * command){
@@ -85,6 +132,7 @@ void execute(struct Command * command){
         // printf("Current directory is now: %s\n", cwd);
 
     } else if (strcmp(command_name, "exit") == 0){
+        exit(0);
 
     } else if (strcmp(command_name, "status") == 0){
         printf("%s %i\n", status.type, status.val);
@@ -100,6 +148,16 @@ void execute(struct Command * command){
 
 
 int main (void) {
+
+    struct sigaction SIGCHLD_action;
+	SIGCHLD_action.sa_handler = handle_SIGCHLD;
+	sigfillset(&SIGCHLD_action.sa_mask);
+	// SIGCHLD_action.sa_flags = SA_RESTART;
+    SIGCHLD_action.sa_flags = 0;
+	sigaction(SIGCHLD, &SIGCHLD_action, NULL);
+
+    set_SIGTSTP();
+    ignore_SIGINT();
 
     char buf[2048];
     struct Command command;
@@ -118,6 +176,22 @@ int main (void) {
 
     }
 }
+
+
+// void print_struct(struct Command * command){
+
+//     for (int i=0; i<command->argc; i++){
+//         printf("%s\n", command->args[i]);
+//     }
+
+//     if (command->inputf)
+//         printf("%s\n", command->inputf);
+    
+//     if (command->outputf)
+//         printf("%s\n", command->outputf);
+//     printf("%i\n", command->background);
+// }
+
 
 void parse_input(char buf[], struct Command * command){
     // clear struct
@@ -155,6 +229,8 @@ void parse_input(char buf[], struct Command * command){
 
     command->argc = i;
 }
+
+
 
 
 int get_input(char buf[]){
@@ -233,16 +309,52 @@ void handle_redirect(struct Command * command){
 
 
 
-void print_struct(struct Command * command){
-
-    for (int i=0; i<command->argc; i++){
-        printf("%s\n", command->args[i]);
+void reset_SIGINT(struct Command * command){
+    if (!command->background){
+        struct sigaction ignore_action;
+        ignore_action.sa_handler = SIG_DFL;
+        ignore_action.sa_flags = SA_RESTART;
+        sigemptyset(&ignore_action.sa_mask);
+        sigaction(SIGINT, &ignore_action, NULL);
     }
 
-    if (command->inputf)
-        printf("%s\n", command->inputf);
-    
-    if (command->outputf)
-        printf("%s\n", command->outputf);
-    printf("%i\n", command->background);
+}
+
+void ignore_SIGINT(){
+    struct sigaction ignore_action;
+    ignore_action.sa_handler = SIG_IGN;
+    ignore_action.sa_flags = SA_RESTART;
+    sigemptyset(&ignore_action.sa_mask);
+    sigaction(SIGINT, &ignore_action, NULL);
+}
+
+void set_SIGTSTP(){
+    struct sigaction SIGTSTP_action;
+	SIGTSTP_action.sa_handler = handle_SIGTSTP;
+	sigfillset(&SIGTSTP_action.sa_mask);
+	SIGTSTP_action.sa_flags = SA_RESTART;
+	sigaction(SIGTSTP, &SIGTSTP_action, NULL);
+}
+
+
+void ignore_SIGTSTP(){
+    struct sigaction ignore_action;
+    ignore_action.sa_handler = SIG_IGN;
+    ignore_action.sa_flags = SA_RESTART;
+    sigemptyset(&ignore_action.sa_mask);
+    sigaction(SIGTSTP, &ignore_action, NULL);
+
+}
+
+
+
+void handle_SIGTSTP(){
+    foreground_only = foreground_only == 1 ? 0 : 1;
+    if (process_in_foreground)
+        TSTP_received = 1;
+    else {
+        write(STDOUT_FILENO, "\n", 1);
+        foreground_only == 1 ? write(STDOUT_FILENO, entering, 49) : write(STDOUT_FILENO, exiting, 29);
+        write(STDOUT_FILENO, ":", 2);
+    }
 }
